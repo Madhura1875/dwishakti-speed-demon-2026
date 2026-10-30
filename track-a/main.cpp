@@ -15,7 +15,7 @@
 
 using namespace std;
 
-struct Group { uint32_t koff, eplen, count = 0, start = 0; uint64_t errors = 0; uint32_t hv = 0; };
+struct Group { uint32_t koff, eplen, count = 0, start = 0; uint64_t errors = 0; uint32_t hv = 0, tag = 0; };
 
 // "YYYY-MM-DDTHH" as a number that sorts the same way as the text.
 static uint32_t hourOf(const char* t) {
@@ -63,7 +63,7 @@ struct Table {
                 return (uint32_t)slots[s] - 1;
         }
         uint32_t id = groups.size();
-        groups.push_back({(uint32_t)keys.size(), len, 0, 0, 0, hourOf(ts)});
+        groups.push_back({(uint32_t)keys.size(), len, 0, 0, 0, hourOf(ts), tag});
         keys.insert(keys.end(), ts, ts + 13);
         keys.insert(keys.end(), ep, ep + len);
         slots[s] = ((uint64_t)tag << 32) | (id + 1);
@@ -145,20 +145,36 @@ int main(int argc, char* argv[]) {
     });
     close(fd);
 
-    // Merge the slices' groups into one table and give each group a slice of vals.
+    // Merge the slices' groups. Each thread owns the groups whose hash falls in its shard.
+    vector<Table> shards(n);
+    auto shardOf = [&](const Group& g) { return (uint64_t)g.tag * n >> 32; };
+    parallel(n, [&](int s) {
+        for (Table& t : parts)
+            for (Group& l : t.groups) {
+                if (shardOf(l) != (uint64_t)s) continue;
+                uint32_t g = shards[s].idOf(&t.keys[l.koff], &t.keys[l.koff + 13], l.eplen);
+                shards[s].groups[g].count += l.count;
+                shards[s].groups[g].errors += l.errors;
+                l.start = g;  // for now: local group -> id within its shard
+            }
+    });
     Table all;
-    all.slots.assign(1 << 18, 0);
-    all.groups.reserve(1 << 18);
-    all.keys.reserve(1 << 23);
-    for (Table& t : parts) {
-        for (Group& l : t.groups) {
-            uint32_t g = all.idOf(&t.keys[l.koff], &t.keys[l.koff + 13], l.eplen);
-            all.groups[g].count += l.count;
-            all.groups[g].errors += l.errors;
-            l.start = g;  // for now: local group -> global id
+    vector<uint32_t> base(n);
+    for (int s = 0; s < n; s++) {
+        base[s] = all.groups.size();
+        for (Group g : shards[s].groups) {
+            g.koff += all.keys.size();
+            all.groups.push_back(g);
         }
+        all.keys.insert(all.keys.end(), shards[s].keys.begin(), shards[s].keys.end());
+    }
+    vector<Table>().swap(shards);
+    for (Table& t : parts) {
+        for (Group& l : t.groups) l.start += base[shardOf(l)];  // now: local group -> global id
         vector<char>().swap(t.keys);
     }
+
+    // Give each group a slice of vals and each slice's records a place inside it.
     uint32_t total = 0;
     for (Group& g : all.groups) { g.start = total; total += g.count; }
     vector<uint32_t> fill(all.groups.size());
