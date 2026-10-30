@@ -15,7 +15,13 @@
 
 using namespace std;
 
-struct Group { uint32_t koff, eplen, count = 0, start = 0; uint64_t errors = 0; };
+struct Group { uint32_t koff, eplen, count = 0, start = 0; uint64_t errors = 0; uint32_t hv = 0; };
+
+// "YYYY-MM-DDTHH" as a number that sorts the same way as the text.
+static uint32_t hourOf(const char* t) {
+    auto two = [&](int i) { return (t[i] - '0') * 10 + t[i + 1] - '0'; };
+    return (((two(0) * 100 + two(2)) * 13 + two(5)) * 32 + two(8)) * 24 + two(11);
+}
 
 // The (hour, endpoint) groups seen so far, with an open-addressing hash index.
 struct Table {
@@ -57,7 +63,7 @@ struct Table {
                 return (uint32_t)slots[s] - 1;
         }
         uint32_t id = groups.size();
-        groups.push_back({(uint32_t)keys.size(), len});
+        groups.push_back({(uint32_t)keys.size(), len, 0, 0, 0, hourOf(ts)});
         keys.insert(keys.end(), ts, ts + 13);
         keys.insert(keys.end(), ep, ep + len);
         slots[s] = ((uint64_t)tag << 32) | (id + 1);
@@ -141,6 +147,9 @@ int main(int argc, char* argv[]) {
 
     // Merge the slices' groups into one table and give each group a slice of vals.
     Table all;
+    all.slots.assign(1 << 18, 0);
+    all.groups.reserve(1 << 18);
+    all.keys.reserve(1 << 23);
     for (Table& t : parts) {
         for (Group& l : t.groups) {
             uint32_t g = all.idOf(&t.keys[l.koff], &t.keys[l.koff + 13], l.eplen);
@@ -166,23 +175,26 @@ int main(int argc, char* argv[]) {
         vector<uint64_t>().swap(t.recs);
     });
 
-    // Sort the groups by hour, then endpoint (unsigned bytes): sorted chunks, then merged.
-    vector<uint32_t> order(all.groups.size());
-    iota(order.begin(), order.end(), 0);
-    auto before = [&](uint32_t a, uint32_t b) {
-        const Group &x = all.groups[a], &y = all.groups[b];
-        int c = memcmp(&all.keys[x.koff], &all.keys[y.koff], 13);
-        if (!c) c = memcmp(&all.keys[x.koff + 13], &all.keys[y.koff + 13], min(x.eplen, y.eplen));
-        return c ? c < 0 : x.eplen < y.eplen;
-    };
-    size_t m = order.size();
-    auto at = [&](int i) { return order.begin() + m * i / n; };
-    parallel(n, [&](int i) { sort(at(i), at(i + 1), before); });
-    for (int w = 1; w < n; w *= 2)
-        for (int i = 0; i + w < n; i += 2 * w)
-            inplace_merge(at(i), at(i + w), at(min(i + 2 * w, n)), before);
+    // Order the groups by hour (counting sort), then by endpoint (unsigned bytes) within each hour.
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (const Group& g : all.groups) { lo = min(lo, g.hv); hi = max(hi, g.hv); }
+    vector<uint32_t> first(hi - lo + 2);  // hour lo + h occupies order[first[h], first[h + 1])
+    for (const Group& g : all.groups) first[g.hv - lo + 1]++;
+    partial_sum(first.begin(), first.end(), first.begin());
+    vector<uint32_t> order(all.groups.size()), put(first.begin(), first.end() - 1);
+    for (uint32_t i = 0; i < order.size(); i++) order[put[all.groups[i].hv - lo]++] = i;
+    parallel(n, [&](int i) {
+        for (size_t h = i; h + 1 < first.size(); h += n)
+            sort(order.begin() + first[h], order.begin() + first[h + 1], [&](uint32_t a, uint32_t b) {
+                const Group &x = all.groups[a], &y = all.groups[b];
+                int c = memcmp(&all.keys[x.koff + 13], &all.keys[y.koff + 13], min(x.eplen, y.eplen));
+                return c ? c < 0 : x.eplen < y.eplen;
+            });
+    });
 
     // Each thread turns its share of the sorted groups into output text.
+    size_t m = order.size();
+    auto at = [&](int i) { return order.begin() + m * i / n; };
     vector<string> outs(n);
     parallel(n, [&](int i) {
         string& s = outs[i];
