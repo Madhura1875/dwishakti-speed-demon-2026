@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdint>
 #include <filesystem>
@@ -15,10 +16,27 @@ struct Group {
     uint64_t errors = 0;
 };
 
-uint32_t percentile(const vector<uint32_t>& values, int p) {
+array<uint32_t, 3> getPercentiles(vector<uint32_t>& values) {
     size_t n = values.size();
-    size_t rank = (p * n + 99) / 100;
-    return values[rank - 1];
+
+    size_t i50 = (50 * n + 99) / 100 - 1;
+    size_t i95 = (95 * n + 99) / 100 - 1;
+    size_t i99 = (99 * n + 99) / 100 - 1;
+
+    auto first = values.begin();
+    auto last = values.end();
+
+    nth_element(first, first + i50, last);
+
+    if (i95 > i50) {
+        nth_element(first + i50 + 1, first + i95, last);
+    }
+
+    if (i99 > i95) {
+        nth_element(first + i95 + 1, first + i99, last);
+    }
+
+    return {values[i50], values[i95], values[i99]};
 }
 
 int main(int argc, char* argv[]) {
@@ -43,11 +61,9 @@ int main(int argc, char* argv[]) {
         size_t s3 = line.find(' ', s2 + 1);
         size_t s4 = line.find(' ', s3 + 1);
 
-        // Extract UTC hour and endpoint.
         string hour = line.substr(0, 13);
         string endpoint = line.substr(s2 + 1, s3 - s2 - 1);
 
-        // Combine hour and endpoint into a unique group key.
         string key = hour;
         key.push_back('\t');
         key += endpoint;
@@ -60,13 +76,11 @@ int main(int argc, char* argv[]) {
 
         Group& group = it->second;
 
-        // Parse HTTP status.
         int status =
             (line[s3 + 1] - '0') * 100 +
             (line[s3 + 2] - '0') * 10 +
             (line[s3 + 3] - '0');
 
-        // Parse unsigned 32-bit latency.
         uint32_t latency = 0;
 
         const char* first = line.data() + s4 + 1;
@@ -83,7 +97,6 @@ int main(int argc, char* argv[]) {
 
     input.close();
 
-    // Sort groups by hour and endpoint.
     using Entry = unordered_map<string, Group>::value_type;
 
     vector<const Entry*> ordered;
@@ -107,13 +120,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Generate the exact required output.
     for (const Entry* entry : ordered) {
         const string& key = entry->first;
         Group& group = const_cast<Group&>(entry->second);
 
         auto& values = group.latencies;
-        sort(values.begin(), values.end());
+
+        auto percentiles = getPercentiles(values);
 
         uint64_t count = values.size();
         uint64_t errors = group.errors;
@@ -123,9 +136,9 @@ int main(int argc, char* argv[]) {
         output << key.substr(0, 13) << ":00:00Z "
                << key.substr(14) << " "
                << count << " "
-               << percentile(values, 50) << " "
-               << percentile(values, 95) << " "
-               << percentile(values, 99) << " "
+               << percentiles[0] << " "
+               << percentiles[1] << " "
+               << percentiles[2] << " "
                << errors << " "
                << ppm << "\n";
     }
