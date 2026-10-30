@@ -144,6 +144,7 @@ int main(int argc, char* argv[]) {
         scan(fd, cut[i], cut[i + 1], parts[i]);
     });
     close(fd);
+    for (Table& t : parts) vector<uint64_t>().swap(t.slots);  // the lookup index is not needed after parsing
 
     // Merge the slices' groups. Each thread owns the groups whose hash falls in its shard.
     vector<Table> shards(n);
@@ -160,6 +161,10 @@ int main(int argc, char* argv[]) {
     });
     Table all;
     vector<uint32_t> base(n);
+    size_t ng = 0, nk = 0;
+    for (const Table& s : shards) { ng += s.groups.size(); nk += s.keys.size(); }
+    all.groups.reserve(ng);
+    all.keys.reserve(nk);
     for (int s = 0; s < n; s++) {
         base[s] = all.groups.size();
         for (Group g : shards[s].groups) {
@@ -247,5 +252,5 @@ int main(int argc, char* argv[]) {
     if (!f) { fprintf(stderr, "Cannot create summary.txt\n"); return 1; }
     for (const string& s : outs) fwrite(s.data(), 1, s.size(), f);
     fclose(f);
-    return 0;
+    _exit(0);  // skip freeing ~90 MB of containers; the OS reclaims it anyway
 }
