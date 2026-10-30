@@ -1,2 +1,6 @@
 .out/
 data/
+
+# Local testing folders
+/reference-output/
+/speed-demon-2026/
