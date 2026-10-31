@@ -1,256 +1,239 @@
-#include <iostream>
-#include <vector>
-#include <queue>
+// Track D (Traverse): multithreaded load + CSR build, then bidirectional
+// Dijkstra per query with the correct stopping rule, queries run in parallel.
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <thread>
+#include <vector>
 
 using namespace std;
 
-const uint64_t INF = UINT64_MAX;
+static constexpr uint64_t INF = UINT64_MAX;
 
-inline int parse_int(const char*& p) {
-    int x = 0;
-    while (*p >= '0' && *p <= '9') {
-        x = x * 10 + (*p - '0');
-        ++p;
-    }
-    ++p;
-    return x;
-}
+struct Arc  { uint32_t to, w; };
+struct Edge { uint32_t u, v, w; };
+struct Item { uint64_t d; uint32_t v; };
 
-inline uint32_t parse_u32(const char*& p) {
+static inline bool item_gt(const Item& a, const Item& b) { return a.d > b.d; }
+
+static inline bool is_digit(char c) { return (unsigned)(c - '0') <= 9u; }
+
+// Skips anything that is not a digit (spaces, \n, \r), then reads one number.
+static inline bool next_num(const char*& p, const char* end, uint32_t& out) {
+    while (p < end && !is_digit(*p)) ++p;
+    if (p >= end) return false;
     uint32_t x = 0;
-    while (*p >= '0' && *p <= '9') {
-        x = x * 10 + (*p - '0');
-        ++p;
-    }
-    ++p;
-    return x;
+    while (p < end && is_digit(*p)) { x = x * 10 + (uint32_t)(*p - '0'); ++p; }
+    out = x;
+    return true;
 }
 
-struct RawEdge {
-    int u, v;
-    uint32_t w;
-    bool operator<(const RawEdge& other) const {
-        if (u != other.u) return u < other.u;
-        if (v != other.v) return v < other.v;
-        return w < other.w;
-    }
-};
-
-struct CSRGraph {
-    int n;
-    vector<int> head;
-    vector<int> edges_v;
-    vector<uint32_t> edges_w;
-};
-
-int main() {
-    ios_base::sync_with_stdio(false);
-    cin.tie(NULL);
-
-    FILE* f = fopen("/data/graph.txt", "rb");
-    if (!f) return 1;
+static char* slurp(const char* path, size_t& size) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return nullptr;
     fseek(f, 0, SEEK_END);
-    size_t size = ftell(f);
+    size = (size_t)ftell(f);
     fseek(f, 0, SEEK_SET);
-
-    vector<char> buffer(size + 1);
-    fread(buffer.data(), 1, size, f);
+    char* b = (char*)malloc(size + 1);
+    size = fread(b, 1, size, f);
     fclose(f);
+    b[size] = 0;
+    return b;
+}
 
-    const char* p = buffer.data();
-    int n = parse_int(p);
-    int m = parse_u32(p);
+template <class F>
+static void run_threads(int T, F&& fn) {
+    vector<thread> th;
+    for (int t = 1; t < T; ++t) th.emplace_back([&fn, t] { fn(t); });
+    fn(0);
+    for (auto& x : th) x.join();
+}
 
-    vector<RawEdge> raw_edges;
-    raw_edges.reserve(m);
-    for (int i = 0; i < m; ++i) {
-        int u = parse_int(p);
-        int v = parse_int(p);
-        uint32_t w = parse_u32(p);
-        if (u != v) raw_edges.push_back({u, v, w});
+struct Searcher {
+    uint32_t n;
+    const uint32_t *fh, *rh;
+    const Arc *fa, *ra;
+    vector<uint64_t> df, db;
+    vector<uint32_t> tf, tb;
+    vector<Item> hf, hb;
+
+    Searcher(uint32_t n_, const uint32_t* fh_, const Arc* fa_, const uint32_t* rh_, const Arc* ra_)
+        : n(n_), fh(fh_), rh(rh_), fa(fa_), ra(ra_), df(n_, INF), db(n_, INF) {
+        hf.reserve(1 << 16); hb.reserve(1 << 16);
     }
 
-    sort(raw_edges.begin(), raw_edges.end());
-    vector<RawEdge> edges;
-    edges.reserve(raw_edges.size());
-    for (size_t i = 0; i < raw_edges.size(); ++i) {
-        if (i + 1 < raw_edges.size() && raw_edges[i].u == raw_edges[i+1].u && raw_edges[i].v == raw_edges[i+1].v) {
-            edges.push_back(raw_edges[i]);
-            while (i + 1 < raw_edges.size() && raw_edges[i].u == raw_edges[i+1].u && raw_edges[i].v == raw_edges[i+1].v) i++;
-        } else {
-            edges.push_back(raw_edges[i]);
+    static inline void clean(vector<Item>& h, const vector<uint64_t>& dist) {
+        while (!h.empty() && h.front().d > dist[h.front().v]) {
+            pop_heap(h.begin(), h.end(), item_gt);
+            h.pop_back();
         }
     }
 
-    int num_clean_edges = edges.size();
-    vector<int> f_deg(n + 1, 0), b_deg(n + 1, 0);
-    for (const auto& e : edges) {
-        f_deg[e.u + 1]++;
-        b_deg[e.v + 1]++;
-    }
-
-    for (int i = 0; i < n; ++i) {
-        f_deg[i + 1] += f_deg[i];
-        b_deg[i + 1] += b_deg[i];
-    }
-
-    CSRGraph fwd, rev;
-    fwd.n = rev.n = n;
-    fwd.head.resize(n + 1);
-    rev.head.resize(n + 1);
-    for (int i = 0; i <= n; ++i) {
-        fwd.head[i] = f_deg[i];
-        rev.head[i] = b_deg[i];
-    }
-
-    fwd.edges_v.resize(num_clean_edges);
-    fwd.edges_w.resize(num_clean_edges);
-    rev.edges_v.resize(num_clean_edges);
-    rev.edges_w.resize(num_clean_edges);
-
-    for (const auto& e : edges) {
-        int idx1 = f_deg[e.u]++;
-        fwd.edges_v[idx1] = e.v;
-        fwd.edges_w[idx1] = e.w;
-
-        int idx2 = b_deg[e.v]++;
-        rev.edges_v[idx2] = e.u;
-        rev.edges_w[idx2] = e.w;
-    }
-
-    FILE* qf = fopen("/data/queries.txt", "rb");
-    if (!qf) return 1;
-    fseek(qf, 0, SEEK_END);
-    size_t q_size = ftell(qf);
-    fseek(qf, 0, SEEK_SET);
-
-    vector<char> q_buffer(q_size + 1);
-    fread(q_buffer.data(), 1, q_size, qf);
-    fclose(qf);
-
-    const char* qp = q_buffer.data();
-    vector<pair<int, int>> queries;
-    while (*qp != '\0' && *qp != '\r' && *qp != '\n') {
-        int s = parse_int(qp);
-        int t = parse_int(qp);
-        queries.push_back({s, t});
-    }
-
-    int num_queries = queries.size();
-    vector<uint64_t> dist_f(n, INF);
-    vector<uint64_t> dist_b(n, INF);
-    vector<int> visited_f(n, 0);
-    vector<int> visited_b(n, 0);
-    int token = 0;
-
-    priority_queue<pair<uint64_t, int>, vector<pair<uint64_t, int>>, greater<pair<uint64_t, int>>> pq_f, pq_b;
-    vector<uint64_t> answers(num_queries);
-
-    for (int q = 0; q < num_queries; ++q) {
-        int s = queries[q].first;
-        int t = queries[q].second;
-
-        if (s == t) {
-            answers[q] = 0;
-            continue;
-        }
-
-        token++;
-        while (!pq_f.empty()) pq_f.pop();
-        while (!pq_b.empty()) pq_b.pop();
-
-        dist_f[s] = 0;
-        visited_f[s] = token;
-        pq_f.push({0, s});
-
-        dist_b[t] = 0;
-        visited_b[t] = token;
-        pq_b.push({0, t});
-
-        uint64_t shortest_dist = INF;
-
-        while (!pq_f.empty() || !pq_b.empty()) {
-            if (!pq_f.empty()) {
-                auto [d, u] = pq_f.top();
-                pq_f.pop();
-
-                if (d > dist_f[u]) continue;
-                if (d >= shortest_dist) break;
-
-                if (visited_b[u] == token) {
-                    shortest_dist = min(shortest_dist, d + dist_b[u]);
-                }
-
-                int start = fwd.head[u];
-                int end = fwd.head[u + 1];
-                for (int i = start; i < end; ++i) {
-                    int v = fwd.edges_v[i];
-                    uint32_t w = fwd.edges_w[i];
-                    uint64_t nd = d + w;
-
-                    if (nd < shortest_dist) {
-                        if (visited_f[v] != token || nd < dist_f[v]) {
-                            dist_f[v] = nd;
-                            visited_f[v] = token;
-                            pq_f.push({nd, v});
-                            if (visited_b[v] == token) {
-                                shortest_dist = min(shortest_dist, nd + dist_b[v]);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (!pq_b.empty()) {
-                auto [d, u] = pq_b.top();
-                pq_b.pop();
-
-                if (d > dist_b[u]) continue;
-                if (d >= shortest_dist) break;
-
-                if (visited_f[u] == token) {
-                    shortest_dist = min(shortest_dist, d + dist_f[u]);
-                }
-
-                int start = rev.head[u];
-                int end = rev.head[u + 1];
-                for (int i = start; i < end; ++i) {
-                    int v = rev.edges_v[i];
-                    uint32_t w = rev.edges_w[i];
-                    uint64_t nd = d + w;
-
-                    if (nd < shortest_dist) {
-                        if (visited_b[v] != token || nd < dist_b[v]) {
-                            dist_b[v] = nd;
-                            visited_b[v] = token;
-                            pq_b.push({nd, v});
-                            if (visited_f[v] == token) {
-                                shortest_dist = min(shortest_dist, nd + dist_f[v]);
-                            }
-                        }
-                    }
-                }
+    static inline void step(vector<Item>& h, vector<uint64_t>& dist, vector<uint32_t>& touched,
+                            const vector<uint64_t>& other, const uint32_t* head, const Arc* arcs,
+                            uint64_t& mu) {
+        Item it = h.front();
+        pop_heap(h.begin(), h.end(), item_gt);
+        h.pop_back();
+        const uint64_t d = it.d;
+        const uint32_t u = it.v;
+        for (uint32_t i = head[u], e = head[u + 1]; i < e; ++i) {
+            const Arc a = arcs[i];
+            const uint64_t nd = d + a.w;
+            if (nd < mu && nd < dist[a.to]) {
+                if (dist[a.to] == INF) touched.push_back(a.to);
+                dist[a.to] = nd;
+                h.push_back({nd, a.to});
+                push_heap(h.begin(), h.end(), item_gt);
+                const uint64_t o = other[a.to];
+                if (o != INF && nd + o < mu) mu = nd + o;
             }
         }
-
-        answers[q] = (shortest_dist == INF) ? -1 : shortest_dist;
     }
 
-    FILE* out = fopen("/out/distances.txt", "wb");
-    for (int q = 0; q < num_queries; ++q) {
-        char buf[32];
-        int len;
-        if (answers[q] == (uint64_t)-1) {
-            len = sprintf(buf, "-1\n");
-        } else {
-            len = sprintf(buf, "%llu\n", (unsigned long long)answers[q]);
+    // returns INF if unreachable
+    uint64_t run(uint32_t s, uint32_t t) {
+        if (s == t) return 0;
+        uint64_t mu = INF;
+        df[s] = 0; tf.push_back(s); hf.push_back({0, s});
+        db[t] = 0; tb.push_back(t); hb.push_back({0, t});
+        for (;;) {
+            clean(hf, df);
+            clean(hb, db);
+            if (hf.empty() || hb.empty()) break;           // one side exhausted: mu is final
+            if (hf.front().d + hb.front().d >= mu) break;  // standard stopping rule
+            if (hf.size() <= hb.size()) step(hf, df, tf, db, fh, fa, mu);
+            else                        step(hb, db, tb, df, rh, ra, mu);
         }
-        fwrite(buf, 1, len, out);
+        for (uint32_t v : tf) df[v] = INF;
+        for (uint32_t v : tb) db[v] = INF;
+        tf.clear(); tb.clear(); hf.clear(); hb.clear();
+        return mu;
     }
-    fclose(out);
+};
 
+int main(int argc, char** argv) {
+    const char* graph_path = argc > 3 ? argv[1] : "/data/graph.txt";
+    const char* query_path = argc > 3 ? argv[2] : "/data/queries.txt";
+    const char* out_path   = argc > 3 ? argv[3] : "/out/distances.txt";
+
+    unsigned hw = thread::hardware_concurrency();
+    const int T = (int)min(8u, max(1u, hw));
+
+    // ---------- load graph ----------
+    size_t gsize = 0;
+    char* gbuf = slurp(graph_path, gsize);
+    if (!gbuf) return 1;
+    const char* gend = gbuf + gsize;
+    const char* p = gbuf;
+    uint32_t n = 0, m = 0;
+    next_num(p, gend, n);
+    next_num(p, gend, m);
+    while (p < gend && *p != '\n') ++p;
+    if (p < gend) ++p;
+    const char* body = p;
+
+    // split body into T chunks that start at line starts
+    vector<const char*> cb(T + 1);
+    const size_t blen = (size_t)(gend - body);
+    for (int t = 0; t <= T; ++t) {
+        const char* s = body + blen * (size_t)t / (size_t)T;
+        if (t == T) s = gend;
+        else if (s > body) while (s < gend && s[-1] != '\n') ++s;
+        cb[t] = s;
+    }
+
+    vector<vector<Edge>> es(T);
+    vector<vector<uint32_t>> cf(T), cr(T);
+
+    run_threads(T, [&](int t) {
+        const char* q = cb[t];
+        const char* e = cb[t + 1];
+        auto& ev = es[t];
+        ev.reserve((size_t)m / T + (size_t)m / (4 * T) + 16);
+        uint32_t u, v, w;
+        while (next_num(q, e, u) && next_num(q, e, v) && next_num(q, e, w))
+            if (u != v) ev.push_back({u, v, w});     // self-loops never help
+        cf[t].assign(n, 0);
+        cr[t].assign(n, 0);
+        for (const Edge& x : ev) { cf[t][x.u]++; cr[t][x.v]++; }
+    });
+    free(gbuf);
+
+    // ---------- CSR offsets (per-thread cursors) ----------
+    vector<uint32_t> fh(n + 1), rh(n + 1);
+    uint32_t fsum = 0, rsum = 0;
+    for (uint32_t u = 0; u < n; ++u) {
+        fh[u] = fsum; rh[u] = rsum;
+        for (int t = 0; t < T; ++t) {
+            uint32_t c = cf[t][u]; cf[t][u] = fsum; fsum += c;
+            uint32_t d = cr[t][u]; cr[t][u] = rsum; rsum += d;
+        }
+    }
+    fh[n] = fsum; rh[n] = rsum;
+    const size_t M = fsum;
+    auto fa = make_unique_for_overwrite<Arc[]>(M ? M : 1);
+    auto ra = make_unique_for_overwrite<Arc[]>(M ? M : 1);
+
+    run_threads(T, [&](int t) {
+        auto& a = cf[t];
+        auto& b = cr[t];
+        for (const Edge& x : es[t]) {
+            fa[a[x.u]++] = {x.v, x.w};
+            ra[b[x.v]++] = {x.u, x.w};
+        }
+        vector<Edge>().swap(es[t]);
+        vector<uint32_t>().swap(a);
+        vector<uint32_t>().swap(b);
+    });
+
+    // ---------- load queries ----------
+    size_t qsize = 0;
+    char* qbuf = slurp(query_path, qsize);
+    if (!qbuf) return 1;
+    vector<pair<uint32_t, uint32_t>> queries;
+    {
+        const char* q = qbuf;
+        const char* e = qbuf + qsize;
+        uint32_t s, t;
+        while (next_num(q, e, s) && next_num(q, e, t)) queries.push_back({s, t});
+    }
+    free(qbuf);
+
+    // ---------- answer queries in parallel ----------
+    const size_t Q = queries.size();
+    vector<uint64_t> ans(Q);
+    atomic<size_t> next{0};
+    const int QT = (int)max<size_t>(1, min<size_t>((size_t)T, Q));
+    run_threads(QT, [&](int) {
+        Searcher S(n, fh.data(), fa.get(), rh.data(), ra.get());
+        for (;;) {
+            size_t i = next.fetch_add(1, memory_order_relaxed);
+            if (i >= Q) break;
+            ans[i] = S.run(queries[i].first, queries[i].second);
+        }
+    });
+
+    // ---------- output ----------
+    vector<char> out;
+    out.reserve(Q * 21 + 16);
+    for (size_t i = 0; i < Q; ++i) {
+        if (ans[i] == INF) { out.push_back('-'); out.push_back('1'); }
+        else {
+            char tmp[24]; int len = 0;
+            uint64_t x = ans[i];
+            if (x == 0) tmp[len++] = '0';
+            while (x) { tmp[len++] = (char)('0' + x % 10); x /= 10; }
+            while (len) out.push_back(tmp[--len]);
+        }
+        out.push_back('\n');
+    }
+    FILE* f = fopen(out_path, "wb");
+    if (!f) return 1;
+    fwrite(out.data(), 1, out.size(), f);
+    fclose(f);
     return 0;
 }
