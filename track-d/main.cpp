@@ -1,239 +1,177 @@
-// Track D (Traverse): multithreaded load + CSR build, then bidirectional
-// Dijkstra per query with the correct stopping rule, queries run in parallel.
+// Track D: streaming two-pass CSR build (no edge list, no file-sized buffer),
+// bidirectional Dijkstra per query, queries run in parallel.
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <memory>
+#include <cstring>
+#include <string>
+#include <fcntl.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
-
 using namespace std;
 
-static constexpr uint64_t INF = UINT64_MAX;
+typedef uint32_t u32;
+typedef uint64_t u64;
+static constexpr u64 INF = UINT64_MAX;
+struct Arc { u32 to, w; };
+struct Item { u64 d; u32 v; };
+static bool gt(const Item& a, const Item& b) { return a.d > b.d; }
 
-struct Arc  { uint32_t to, w; };
-struct Edge { uint32_t u, v, w; };
-struct Item { uint64_t d; uint32_t v; };
-
-static inline bool item_gt(const Item& a, const Item& b) { return a.d > b.d; }
-
-static inline bool is_digit(char c) { return (unsigned)(c - '0') <= 9u; }
-
-// Skips anything that is not a digit (spaces, \n, \r), then reads one number.
-static inline bool next_num(const char*& p, const char* end, uint32_t& out) {
-    while (p < end && !is_digit(*p)) ++p;
-    if (p >= end) return false;
-    uint32_t x = 0;
-    while (p < end && is_digit(*p)) { x = x * 10 + (uint32_t)(*p - '0'); ++p; }
-    out = x;
+static inline bool next_num(const char*& p, const char* e, u32& x) {
+    while (p < e && (unsigned)(*p - '0') > 9) ++p;
+    if (p >= e) return false;
+    x = 0;
+    while (p < e && (unsigned)(*p - '0') <= 9) x = x * 10 + (u32)(*p++ - '0');
     return true;
 }
 
-static char* slurp(const char* path, size_t& size) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return nullptr;
-    fseek(f, 0, SEEK_END);
-    size = (size_t)ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char* b = (char*)malloc(size + 1);
-    size = fread(b, 1, size, f);
-    fclose(f);
-    b[size] = 0;
-    return b;
-}
-
-template <class F>
-static void run_threads(int T, F&& fn) {
+template <class F> static void par(int T, F&& fn) {
     vector<thread> th;
     for (int t = 1; t < T; ++t) th.emplace_back([&fn, t] { fn(t); });
     fn(0);
     for (auto& x : th) x.join();
 }
 
+// Streams byte range [a,b) (whole lines) through 1 MB blocks, calls f(u,v,w) per edge.
+template <class F> static void stream_edges(int fd, off_t a, off_t b, F&& f) {
+    const size_t B = 1 << 20;
+    vector<char> buf(B);
+    size_t have = 0;
+    off_t off = a;
+    for (;;) {
+        ssize_t r = off < b ? pread(fd, buf.data() + have, min<off_t>(B - have, b - off), off) : 0;
+        if (r > 0) { off += r; have += r; }
+        bool last = r <= 0 || off >= b;
+        size_t use = have;
+        if (!last) { while (use && buf[use - 1] != '\n') --use; }
+        const char *p = buf.data(), *e = p + use;
+        u32 u, v, w;
+        while (next_num(p, e, u) && next_num(p, e, v) && next_num(p, e, w)) if (u != v) f(u, v, w);
+        memmove(buf.data(), buf.data() + use, have - use);
+        have -= use;
+        if (last) break;
+    }
+}
+
 struct Searcher {
-    uint32_t n;
-    const uint32_t *fh, *rh;
-    const Arc *fa, *ra;
-    vector<uint64_t> df, db;
-    vector<uint32_t> tf, tb;
-    vector<Item> hf, hb;
+    const u32 *fh, *rh; const Arc *fa, *ra;
+    vector<u64> df, db; vector<u32> tf, tb; vector<Item> hf, hb;
+    Searcher(u32 n, const u32* a, const Arc* b, const u32* c, const Arc* d)
+        : fh(a), rh(c), fa(b), ra(d), df(n, INF), db(n, INF) {}
 
-    Searcher(uint32_t n_, const uint32_t* fh_, const Arc* fa_, const uint32_t* rh_, const Arc* ra_)
-        : n(n_), fh(fh_), rh(rh_), fa(fa_), ra(ra_), df(n_, INF), db(n_, INF) {
-        hf.reserve(1 << 16); hb.reserve(1 << 16);
+    static void clean(vector<Item>& h, const vector<u64>& dist) {
+        while (!h.empty() && h.front().d > dist[h.front().v]) { pop_heap(h.begin(), h.end(), gt); h.pop_back(); }
     }
-
-    static inline void clean(vector<Item>& h, const vector<uint64_t>& dist) {
-        while (!h.empty() && h.front().d > dist[h.front().v]) {
-            pop_heap(h.begin(), h.end(), item_gt);
-            h.pop_back();
-        }
-    }
-
-    static inline void step(vector<Item>& h, vector<uint64_t>& dist, vector<uint32_t>& touched,
-                            const vector<uint64_t>& other, const uint32_t* head, const Arc* arcs,
-                            uint64_t& mu) {
+    static void step(vector<Item>& h, vector<u64>& dist, vector<u32>& tch, const vector<u64>& other,
+                     const u32* head, const Arc* arcs, u64& mu) {
         Item it = h.front();
-        pop_heap(h.begin(), h.end(), item_gt);
-        h.pop_back();
-        const uint64_t d = it.d;
-        const uint32_t u = it.v;
-        for (uint32_t i = head[u], e = head[u + 1]; i < e; ++i) {
-            const Arc a = arcs[i];
-            const uint64_t nd = d + a.w;
-            if (nd < mu && nd < dist[a.to]) {
-                if (dist[a.to] == INF) touched.push_back(a.to);
-                dist[a.to] = nd;
-                h.push_back({nd, a.to});
-                push_heap(h.begin(), h.end(), item_gt);
-                const uint64_t o = other[a.to];
-                if (o != INF && nd + o < mu) mu = nd + o;
+        pop_heap(h.begin(), h.end(), gt); h.pop_back();
+        for (u32 i = head[it.v], e = head[it.v + 1]; i < e; ++i) {
+            u64 nd = it.d + arcs[i].w; u32 v = arcs[i].to;
+            if (nd < mu && nd < dist[v]) {
+                if (dist[v] == INF) tch.push_back(v);
+                dist[v] = nd;
+                h.push_back({nd, v}); push_heap(h.begin(), h.end(), gt);
+                if (other[v] != INF && nd + other[v] < mu) mu = nd + other[v];
             }
         }
     }
-
-    // returns INF if unreachable
-    uint64_t run(uint32_t s, uint32_t t) {
+    u64 run(u32 s, u32 t) {
         if (s == t) return 0;
-        uint64_t mu = INF;
+        u64 mu = INF;
         df[s] = 0; tf.push_back(s); hf.push_back({0, s});
         db[t] = 0; tb.push_back(t); hb.push_back({0, t});
         for (;;) {
-            clean(hf, df);
-            clean(hb, db);
-            if (hf.empty() || hb.empty()) break;           // one side exhausted: mu is final
-            if (hf.front().d + hb.front().d >= mu) break;  // standard stopping rule
+            clean(hf, df); clean(hb, db);
+            if (hf.empty() || hb.empty() || hf.front().d + hb.front().d >= mu) break;
             if (hf.size() <= hb.size()) step(hf, df, tf, db, fh, fa, mu);
-            else                        step(hb, db, tb, df, rh, ra, mu);
+            else step(hb, db, tb, df, rh, ra, mu);
         }
-        for (uint32_t v : tf) df[v] = INF;
-        for (uint32_t v : tb) db[v] = INF;
+        for (u32 v : tf) df[v] = INF;
+        for (u32 v : tb) db[v] = INF;
         tf.clear(); tb.clear(); hf.clear(); hb.clear();
         return mu;
     }
 };
 
 int main(int argc, char** argv) {
-    const char* graph_path = argc > 3 ? argv[1] : "/data/graph.txt";
-    const char* query_path = argc > 3 ? argv[2] : "/data/queries.txt";
-    const char* out_path   = argc > 3 ? argv[3] : "/out/distances.txt";
+    const char* gp = argc > 3 ? argv[1] : "/data/graph.txt";
+    const char* qp = argc > 3 ? argv[2] : "/data/queries.txt";
+    const char* op = argc > 3 ? argv[3] : "/out/distances.txt";
+    const int T = (int)min(8u, max(1u, thread::hardware_concurrency()));
 
-    unsigned hw = thread::hardware_concurrency();
-    const int T = (int)min(8u, max(1u, hw));
+    int fd = open(gp, O_RDONLY);
+    if (fd < 0) return 1;
+    const off_t size = lseek(fd, 0, SEEK_END);
+    char hdr[64];
+    ssize_t hl = pread(fd, hdr, sizeof hdr, 0);
+    const char* hp = hdr;
+    u32 n = 0, m = 0;
+    next_num(hp, hdr + hl, n); next_num(hp, hdr + hl, m);
+    off_t body = hp - hdr;
+    while (body < hl && hdr[body] != '\n') ++body;
+    ++body;
 
-    // ---------- load graph ----------
-    size_t gsize = 0;
-    char* gbuf = slurp(graph_path, gsize);
-    if (!gbuf) return 1;
-    const char* gend = gbuf + gsize;
-    const char* p = gbuf;
-    uint32_t n = 0, m = 0;
-    next_num(p, gend, n);
-    next_num(p, gend, m);
-    while (p < gend && *p != '\n') ++p;
-    if (p < gend) ++p;
-    const char* body = p;
-
-    // split body into T chunks that start at line starts
-    vector<const char*> cb(T + 1);
-    const size_t blen = (size_t)(gend - body);
-    for (int t = 0; t <= T; ++t) {
-        const char* s = body + blen * (size_t)t / (size_t)T;
-        if (t == T) s = gend;
-        else if (s > body) while (s < gend && s[-1] != '\n') ++s;
-        cb[t] = s;
+    // line-aligned chunk boundaries
+    vector<off_t> cb(T + 1, size);
+    cb[0] = body;
+    for (int t = 1; t < T; ++t) {
+        off_t r = body + (size - body) * t / T;
+        char w[64];
+        ssize_t k = pread(fd, w, sizeof w, r - 1);
+        off_t bnd = size;
+        for (ssize_t i = 0; i < k; ++i) if (w[i] == '\n') { bnd = r + i; break; }
+        cb[t] = bnd;
     }
 
-    vector<vector<Edge>> es(T);
-    vector<vector<uint32_t>> cf(T), cr(T);
-
-    run_threads(T, [&](int t) {
-        const char* q = cb[t];
-        const char* e = cb[t + 1];
-        auto& ev = es[t];
-        ev.reserve((size_t)m / T + (size_t)m / (4 * T) + 16);
-        uint32_t u, v, w;
-        while (next_num(q, e, u) && next_num(q, e, v) && next_num(q, e, w))
-            if (u != v) ev.push_back({u, v, w});     // self-loops never help
-        cf[t].assign(n, 0);
-        cr[t].assign(n, 0);
-        for (const Edge& x : ev) { cf[t][x.u]++; cr[t][x.v]++; }
+    vector<u32> fh(n + 1, 0), rh(n + 1, 0);
+    auto cnt = [&](int t) {
+        stream_edges(fd, cb[t], cb[t + 1], [&](u32 u, u32 v, u32) {
+            atomic_ref<u32>(fh[u]).fetch_add(1, memory_order_relaxed);
+            atomic_ref<u32>(rh[v]).fetch_add(1, memory_order_relaxed);
+        });
+    };
+    par(T, cnt);
+    u32 fs = 0, rs = 0;
+    for (u32 u = 0; u < n; ++u) {
+        u32 a = fh[u]; fh[u] = fs; fs += a;
+        u32 b = rh[u]; rh[u] = rs; rs += b;
+    }
+    vector<Arc> fa(fs), ra(rs);
+    par(T, [&](int t) {
+        stream_edges(fd, cb[t], cb[t + 1], [&](u32 u, u32 v, u32 w) {
+            fa[atomic_ref<u32>(fh[u]).fetch_add(1, memory_order_relaxed)] = {v, w};
+            ra[atomic_ref<u32>(rh[v]).fetch_add(1, memory_order_relaxed)] = {u, w};
+        });
     });
-    free(gbuf);
+    close(fd);
+    for (u32 u = n; u > 0; --u) { fh[u] = fh[u - 1]; rh[u] = rh[u - 1]; }  // cursors -> starts
+    fh[0] = rh[0] = 0;
 
-    // ---------- CSR offsets (per-thread cursors) ----------
-    vector<uint32_t> fh(n + 1), rh(n + 1);
-    uint32_t fsum = 0, rsum = 0;
-    for (uint32_t u = 0; u < n; ++u) {
-        fh[u] = fsum; rh[u] = rsum;
-        for (int t = 0; t < T; ++t) {
-            uint32_t c = cf[t][u]; cf[t][u] = fsum; fsum += c;
-            uint32_t d = cr[t][u]; cr[t][u] = rsum; rsum += d;
-        }
-    }
-    fh[n] = fsum; rh[n] = rsum;
-    const size_t M = fsum;
-    auto fa = make_unique_for_overwrite<Arc[]>(M ? M : 1);
-    auto ra = make_unique_for_overwrite<Arc[]>(M ? M : 1);
+    vector<pair<u32, u32>> qs;
+    if (FILE* f = fopen(qp, "rb")) {
+        vector<char> b(1 << 20);
+        size_t len = fread(b.data(), 1, b.size(), f);
+        fclose(f);
+        const char *p = b.data(), *e = p + len;
+        u32 s, t;
+        while (next_num(p, e, s) && next_num(p, e, t)) qs.push_back({s, t});
+    } else return 1;
 
-    run_threads(T, [&](int t) {
-        auto& a = cf[t];
-        auto& b = cr[t];
-        for (const Edge& x : es[t]) {
-            fa[a[x.u]++] = {x.v, x.w};
-            ra[b[x.v]++] = {x.u, x.w};
-        }
-        vector<Edge>().swap(es[t]);
-        vector<uint32_t>().swap(a);
-        vector<uint32_t>().swap(b);
+    vector<u64> ans(qs.size());
+    atomic<size_t> nxt{0};
+    const int QT = (int)max<size_t>(1, min<size_t>(min(T, 4), qs.size()));
+    par(QT, [&](int) {
+        Searcher S(n, fh.data(), fa.data(), rh.data(), ra.data());
+        for (size_t i; (i = nxt.fetch_add(1)) < qs.size();) ans[i] = S.run(qs[i].first, qs[i].second);
     });
 
-    // ---------- load queries ----------
-    size_t qsize = 0;
-    char* qbuf = slurp(query_path, qsize);
-    if (!qbuf) return 1;
-    vector<pair<uint32_t, uint32_t>> queries;
-    {
-        const char* q = qbuf;
-        const char* e = qbuf + qsize;
-        uint32_t s, t;
-        while (next_num(q, e, s) && next_num(q, e, t)) queries.push_back({s, t});
-    }
-    free(qbuf);
-
-    // ---------- answer queries in parallel ----------
-    const size_t Q = queries.size();
-    vector<uint64_t> ans(Q);
-    atomic<size_t> next{0};
-    const int QT = (int)max<size_t>(1, min<size_t>((size_t)T, Q));
-    run_threads(QT, [&](int) {
-        Searcher S(n, fh.data(), fa.get(), rh.data(), ra.get());
-        for (;;) {
-            size_t i = next.fetch_add(1, memory_order_relaxed);
-            if (i >= Q) break;
-            ans[i] = S.run(queries[i].first, queries[i].second);
-        }
-    });
-
-    // ---------- output ----------
-    vector<char> out;
-    out.reserve(Q * 21 + 16);
-    for (size_t i = 0; i < Q; ++i) {
-        if (ans[i] == INF) { out.push_back('-'); out.push_back('1'); }
-        else {
-            char tmp[24]; int len = 0;
-            uint64_t x = ans[i];
-            if (x == 0) tmp[len++] = '0';
-            while (x) { tmp[len++] = (char)('0' + x % 10); x /= 10; }
-            while (len) out.push_back(tmp[--len]);
-        }
-        out.push_back('\n');
-    }
-    FILE* f = fopen(out_path, "wb");
+    string out;
+    for (u64 x : ans) out += (x == INF ? string("-1") : to_string(x)) + '\n';
+    FILE* f = fopen(op, "wb");
     if (!f) return 1;
     fwrite(out.data(), 1, out.size(), f);
     fclose(f);
-    return 0;
 }
