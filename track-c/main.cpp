@@ -4,7 +4,7 @@
 // a record boundary: a newline followed (after an optional byte order mark) by
 // a digit, which quoted text never contains. Per country a thread keeps count,
 // id sum, money sum/min/max, byte totals and a hash of every name; the distinct
-// names are counted at the end by sorting those hashes.
+// names are counted at the end by inserting those hashes into a small set.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -24,18 +24,32 @@ typedef uint64_t u64;
 typedef int64_t i64;
 
 struct Agg {
-  u64 count = 0, idSum = 0, nameBytes = 0, noteBytes = 0;
+  u64 count = 0, idSum = 0, nameBytes = 0, noteBytes = 0, *last = nullptr;
   i64 sum = 0, lo = INT64_MAX, hi = INT64_MIN;
+
+  // The hash of every record's name goes into a linked list of blocks of 127
+  // (slot 0 links to the previous block), so growing never copies or
+  // fragments memory. Blocks are kept until exit. Adding also counts a record.
+  void add(u64 h) {
+    if (count % 127 == 0) {
+      u64 *b = (u64 *)malloc(128 * 8);
+      *b = (u64)last, last = b;
+    }
+    last[1 + count++ % 127] = h;
+  }
+  template <class F> void each(F f) const { // every block but the last is full
+    for (u64 *b = last, left = count; b;
+         left -= (left - 1) % 127 + 1, b = (u64 *)*b)
+      for (u64 k = 0; k <= (left - 1) % 127; k++)
+        f(b[1 + k]);
+  }
 };
 
 static vector<uint16_t> region; // region id -> group index; 0 is _UNMATCHED
 
 struct Worker {
   vector<Agg> agg;
-  vector<vector<u64>> names; // per group: hash of every record's name
   string tmp;
-
-  Worker(size_t groups) : agg(groups), names(groups) {}
 
   // Reads the text field at p, quoted or not, and returns the comma after it.
   // esc counts the "" pairs inside.
@@ -81,25 +95,19 @@ struct Worker {
     if (nesc) { // unescape "" so that a name hashes the same however it was
                 // written
       tmp.clear();
-      for (size_t i = 0; i < name.size(); i++) {
-        tmp += name[i];
-        i += name[i] == '"';
-      }
+      for (size_t i = 0; i < name.size(); i++)
+        tmp += name[i], i += name[i] == '"';
       name = tmp;
     }
     size_t g = rid < region.size() ? region[rid] : 0;
     Agg &a = agg[g];
-    a.count++;
     a.idSum += id;
     a.sum += cents;
     a.lo = min(a.lo, cents);
     a.hi = max(a.hi, cents);
     a.nameBytes += name.size();
     a.noteBytes += note.size() - tesc;
-    vector<u64> &v = names[g];
-    if (v.size() == v.capacity())
-      v.reserve(v.size() * 5 / 4 + 64); // grow by 1.25x, not 2x: less slack
-    v.push_back(hash<string_view>()(name));
+    a.add(hash<string_view>()(name));
     return p;
   }
 };
@@ -141,10 +149,8 @@ int main(int argc, char *argv[]) {
   size_t ng = groups.size();
 
   int fd = open((dataDir + "/records.csv").c_str(), O_RDONLY);
-  if (fd < 0) {
-    fprintf(stderr, "Cannot open records.csv\n");
-    return 1;
-  }
+  if (fd < 0)
+    return fprintf(stderr, "Cannot open records.csv\n"), 1;
   off_t size = lseek(fd, 0, SEEK_END);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
@@ -169,7 +175,7 @@ int main(int argc, char *argv[]) {
     bounds[i] =
         max<off_t>(boundary(i ? size * i / n - 1 : 0), i ? bounds[i - 1] : 0);
 
-  vector<Worker> ws(n, Worker(ng));
+  vector<Worker> ws(n, Worker{vector<Agg>(ng), {}});
   const size_t CH = 1 << 18,
                MARGIN = 1 << 16; // a record is far shorter than MARGIN
   parallel(n, [&](int i) {
@@ -210,21 +216,34 @@ int main(int argc, char *argv[]) {
     }
   vector<u64> distinct(ng);
   parallel(n, [&](int i) {
+    vector<u64> set;
     for (size_t g = i; g < ng; g += n) {
-      vector<u64> all;
-      for (Worker &w : ws)
-        all.insert(all.end(), w.names[g].begin(), w.names[g].end());
-      sort(all.begin(), all.end());
-      distinct[g] = unique(all.begin(), all.end()) - all.begin();
+      // Open-addressing set of hashes (0 = empty). A big group is split into
+      // passes by hash range so that the table stays small.
+      size_t parts = total[g].count / 65536 + 1, cap = 16;
+      while (cap < total[g].count / parts * 3 / 2)
+        cap *= 2;
+      for (size_t p = 0; p < parts; p++) {
+        set.assign(cap, 0);
+        for (Worker &w : ws)
+          w.agg[g].each([&](u64 h) {
+            if ((h >> 32) * parts >> 32 == p) {
+              h |= 1;
+              size_t k = (h >> 3) & (cap - 1);
+              while (set[k] && set[k] != h)
+                k = (k + 1) & (cap - 1);
+              distinct[g] += !set[k];
+              set[k] = h;
+            }
+          });
+      }
     }
   });
 
   filesystem::create_directories(outDir);
   ofstream out(outDir + "/aggregates.txt", ios::binary);
-  if (!out) {
-    fprintf(stderr, "Cannot create aggregates.txt\n");
-    return 1;
-  }
+  if (!out)
+    return fprintf(stderr, "Cannot create aggregates.txt\n"), 1;
   for (auto &[code, g] : groups) {
     const Agg &a = total[g];
     if (a.count)
