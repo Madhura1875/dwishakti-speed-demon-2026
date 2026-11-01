@@ -8,6 +8,7 @@
 #include <string>
 #include <fcntl.h>
 #include <thread>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 using namespace std;
@@ -16,6 +17,15 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 static constexpr u64 INF = UINT64_MAX;
 struct Arc { u32 to, w; };
+
+// Arc array of size k, not zeroed, on huge pages where the system allows it:
+// the build writes it in random order, so fewer page-table misses matter.
+static Arc* arcs(size_t k) {
+    size_t bytes = (k * sizeof(Arc) + (2 << 20) - 1) & ~(size_t)((2 << 20) - 1);
+    void* p = aligned_alloc(2 << 20, bytes);
+    madvise(p, bytes, MADV_HUGEPAGE);
+    return (Arc*)p;
+}
 struct Item { u64 d; u32 v; };
 static bool gt(const Item& a, const Item& b) { return a.d > b.d; }
 
@@ -114,36 +124,28 @@ int main(int argc, char** argv) {
     while (body < hl && hdr[body] != '\n') ++body;
     ++body;
 
-    // line-aligned chunk boundaries
-    vector<off_t> cb(T + 1, size);
-    cb[0] = body;
-    for (int t = 1; t < T; ++t) {
-        off_t r = body + (size - body) * t / T;
-        char w[64];
-        ssize_t k = pread(fd, w, sizeof w, r - 1);
-        off_t bnd = size;
-        for (ssize_t i = 0; i < k; ++i) if (w[i] == '\n') { bnd = r + i; break; }
-        cb[t] = bnd;
-    }
-
     vector<u32> fh(n + 1, 0), rh(n + 1, 0);
-    auto cnt = [&](int t) {
-        stream_edges(fd, cb[t], cb[t + 1], [&](u32 u, u32 v, u32) {
-            atomic_ref<u32>(fh[u]).fetch_add(1, memory_order_relaxed);
-            atomic_ref<u32>(rh[v]).fetch_add(1, memory_order_relaxed);
+    // Each thread owns the vertices [lo(t), lo(t+1)) and reads the whole file,
+    // keeping only the arcs it owns: no atomics and no cache lines shared.
+    auto lo = [&](int t) { return (u32)((u64)n * t / T); };
+    par(T, [&](int t) {
+        u32 a = lo(t), len = lo(t + 1) - a;
+        stream_edges(fd, body, size, [&](u32 u, u32 v, u32) {
+            if (u - a < len) fh[u]++;
+            if (v - a < len) rh[v]++;
         });
-    };
-    par(T, cnt);
+    });
     u32 fs = 0, rs = 0;
     for (u32 u = 0; u < n; ++u) {
         u32 a = fh[u]; fh[u] = fs; fs += a;
         u32 b = rh[u]; rh[u] = rs; rs += b;
     }
-    vector<Arc> fa(fs), ra(rs);
+    Arc *fa = arcs(fs), *ra = arcs(rs);
     par(T, [&](int t) {
-        stream_edges(fd, cb[t], cb[t + 1], [&](u32 u, u32 v, u32 w) {
-            fa[atomic_ref<u32>(fh[u]).fetch_add(1, memory_order_relaxed)] = {v, w};
-            ra[atomic_ref<u32>(rh[v]).fetch_add(1, memory_order_relaxed)] = {u, w};
+        u32 a = lo(t), len = lo(t + 1) - a;
+        stream_edges(fd, body, size, [&](u32 u, u32 v, u32 w) {
+            if (u - a < len) fa[fh[u]++] = {v, w};
+            if (v - a < len) ra[rh[v]++] = {u, w};
         });
     });
     close(fd);
@@ -164,7 +166,7 @@ int main(int argc, char** argv) {
     atomic<size_t> nxt{0};
     const int QT = (int)max<size_t>(1, min<size_t>(min(T, 4), qs.size()));
     par(QT, [&](int) {
-        Searcher S(n, fh.data(), fa.data(), rh.data(), ra.data());
+        Searcher S(n, fh.data(), fa, rh.data(), ra);
         for (size_t i; (i = nxt.fetch_add(1)) < qs.size();) ans[i] = S.run(qs[i].first, qs[i].second);
     });
 
