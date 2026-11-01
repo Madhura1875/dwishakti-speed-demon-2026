@@ -5,9 +5,17 @@
 // a digit, which quoted text never contains. Per country a thread keeps count,
 // id sum, money sum/min/max, byte totals and a hash of every name; the distinct
 // names are counted at the end by inserting those hashes into a small set.
+//
+// Changes from the previous version:
+//  - regions.csv is read with one pread and parsed by hand (no ifstream,
+//    getline, stoul or map lookups per line).
+//  - each thread opens its own fd, so kernel readahead is not shared.
+//  - Worker is cache-line aligned to avoid false sharing between threads.
+//  - a cheap 8-bytes-at-a-time hash replaces std::hash<string_view>.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -22,6 +30,26 @@
 using namespace std;
 typedef uint64_t u64;
 typedef int64_t i64;
+
+// Hashes the bytes of a name. The length is mixed in, so "Betts" and "Betts "
+// never hash alike by construction.
+static inline u64 hashBytes(const char *p, size_t n) {
+  u64 h = 0x9E3779B97F4A7C15ULL ^ n;
+  while (n >= 8) {
+    u64 w;
+    memcpy(&w, p, 8);
+    h = (h ^ w) * 0xff51afd7ed558ccdULL;
+    h ^= h >> 32;
+    p += 8, n -= 8;
+  }
+  u64 w = 0;
+  memcpy(&w, p, n);
+  h = (h ^ w) * 0xc4ceb9fe1a85ec53ULL;
+  h ^= h >> 29;
+  h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 32;
+  return h;
+}
 
 struct Agg {
   u64 count = 0, idSum = 0, nameBytes = 0, noteBytes = 0, *last = nullptr;
@@ -47,7 +75,7 @@ struct Agg {
 
 static vector<uint16_t> region; // region id -> group index; 0 is _UNMATCHED
 
-struct Worker {
+struct alignas(64) Worker {
   vector<Agg> agg;
   string tmp;
 
@@ -107,7 +135,7 @@ struct Worker {
     a.hi = max(a.hi, cents);
     a.nameBytes += name.size();
     a.noteBytes += note.size() - tesc;
-    a.add(hash<string_view>()(name));
+    a.add(hashBytes(name.data(), name.size()));
     return p;
   }
 };
@@ -133,18 +161,45 @@ int main(int argc, char *argv[]) {
          outDir = argc > 2 ? argv[2] : "/out";
 
   // regions.csv: every country code is a group; "_UNMATCHED" is group 0 and
-  // sorts after the codes.
+  // sorts after the codes. The file is read in one go and parsed by hand.
   map<string, size_t> groups{{"_UNMATCHED", 0}};
-  ifstream regions(dataDir + "/regions.csv");
-  string line;
-  getline(regions, line);
-  while (getline(regions, line)) {
-    size_t id = stoul(line);
-    if (id >= region.size())
-      region.resize(id + 1);
-    region[id] =
-        groups.emplace(line.substr(line.find(',') + 1, 3), groups.size())
-            .first->second;
+  {
+    int rf = open((dataDir + "/regions.csv").c_str(), O_RDONLY);
+    if (rf < 0)
+      return fprintf(stderr, "Cannot open regions.csv\n"), 1;
+    off_t rs = lseek(rf, 0, SEEK_END);
+    vector<char> b(rs + 8, 0);
+    for (off_t got = 0; got < rs;) {
+      ssize_t r = pread(rf, &b[got], rs - got, got);
+      if (r <= 0)
+        break;
+      got += r;
+    }
+    close(rf);
+    vector<uint16_t> idx(26 * 26 * 26, 0); // 0 = code not seen yet
+    vector<string> codes;
+    const char *p = (const char *)memchr(b.data(), '\n', rs);
+    const char *e = b.data() + rs;
+    p = p ? p + 1 : e;
+    while (p < e) {
+      size_t id = 0;
+      while (*p != ',')
+        id = id * 10 + (*p++ - '0');
+      ++p;
+      unsigned k = ((p[0] - 'A') * 26 + (p[1] - 'A')) * 26 + (p[2] - 'A');
+      if (!idx[k]) {
+        codes.emplace_back(p, 3);
+        idx[k] = codes.size(); // group indexes start at 1
+      }
+      if (id >= region.size())
+        region.resize(max(id + 1, region.size() * 2));
+      region[id] = idx[k];
+      p = (const char *)memchr(p, '\n',
+                               e - p); // CRLF or LF, or no final newline
+      p = p ? p + 1 : e;
+    }
+    for (size_t i = 0; i < codes.size(); i++)
+      groups.emplace(codes[i], i + 1);
   }
   size_t ng = groups.size();
 
@@ -179,12 +234,15 @@ int main(int argc, char *argv[]) {
   const size_t CH = 1 << 18,
                MARGIN = 1 << 16; // a record is far shorter than MARGIN
   parallel(n, [&](int i) {
+    int tfd = open((dataDir + "/records.csv").c_str(), O_RDONLY);
+    if (tfd < 0)
+      tfd = fd;
     vector<char> buf(CH + 64);
     off_t pos = bounds[i], end = bounds[i + 1];
     size_t have = 0;
     for (bool last = false; !last;) {
       ssize_t got = max<ssize_t>(
-          pread(fd, &buf[have], min<off_t>(CH - have, end - pos), pos), 0);
+          pread(tfd, &buf[have], min<off_t>(CH - have, end - pos), pos), 0);
       pos += got;
       have += got;
       last = !got || pos >= end;
@@ -198,6 +256,8 @@ int main(int argc, char *argv[]) {
       have = e - p;
       memmove(buf.data(), p, have);
     }
+    if (tfd != fd)
+      close(tfd);
   });
   close(fd);
 
