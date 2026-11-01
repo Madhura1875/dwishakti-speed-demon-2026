@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <charconv>
 #include <cstdint>
@@ -20,7 +21,7 @@ using namespace std;
 
 static uint8_t cls[256];  // lowercase letter or digit for token bytes, 0 for separators
 
-struct Query { bool phrase = false; vector<uint32_t> terms; string ops; };  // ops[k - 1] joins terms[k - 1] and terms[k]
+struct Query { bool phrase = false; vector<uint32_t> terms; string ops; vector<uint32_t> pairs; };  // ops[k - 1] joins terms[k - 1] and terms[k]
 
 static string slurp(const string& path) {
     string s;
@@ -89,6 +90,26 @@ int main(int argc, char* argv[]) {
         queries.push_back(move(q));
     }
 
+    // Adjacent term pairs of phrase queries: the scan records which docs contain each pair back to back.
+    unordered_map<uint64_t, uint32_t> pairMap;
+    for (Query& q : queries)
+        if (q.phrase)
+            for (size_t k = 1; k < q.terms.size(); k++) {
+                uint64_t key = (uint64_t)q.terms[k - 1] << 32 | q.terms[k];
+                q.pairs.push_back(pairMap.try_emplace(key, (uint32_t)pairMap.size()).first->second);
+            }
+    size_t P = pairMap.size();
+    int pbits = 4;
+    while ((size_t(1) << pbits) < 4 * P + 16) pbits++;
+    vector<uint64_t> pkey(size_t(1) << pbits, 0);  // key + 1, 0 = empty
+    vector<uint32_t> pval(size_t(1) << pbits, 0);
+    for (auto& [key, id] : pairMap) {
+        size_t x = (key * 0x9E3779B97F4A7C15ull) >> (64 - pbits);
+        while (pkey[x]) x = (x + 1) & (pkey.size() - 1);
+        pkey[x] = key + 1;
+        pval[x] = id;
+    }
+
     // Open-addressing table: (hash high 32 bits << 32) | (term id + 1).
     size_t T = terms.size();
     uint32_t mask = 1;
@@ -126,11 +147,12 @@ int main(int argc, char* argv[]) {
     }
 
     // Each thread scans its slice: per query term, the ascending ids of the docs containing it.
-    struct Slice { vector<vector<uint32_t>> post; vector<uint64_t> start; };  // start: offset of each doc's text
+    struct Slice { vector<vector<uint32_t>> post, pp; vector<uint64_t> start; };  // start: offset of each doc's text
     vector<Slice> slices(n);
     parallel(n, [&](int i) {
         Slice& s = slices[i];
         s.post.resize(T);
+        s.pp.resize(P);
         for (const char* p = base + cut[i]; p < base + cut[i + 1];) {
             const char* nl = (const char*)memchr(p, '\n', fileEnd - p);
             const char* le = nl ? nl : fileEnd;
@@ -139,6 +161,7 @@ int main(int argc, char* argv[]) {
             for (const char* q = p; q < le && *q >= '0' && *q <= '9'; q++) id = id * 10 + (*q - '0');
             const char* t = tab ? tab + 1 : le;
             s.start.push_back(t - base);
+            int64_t prev = -1;
             while (t < le) {
                 uint8_t c = cls[(uint8_t)*t];
                 if (!c) { t++; continue; }
@@ -148,14 +171,26 @@ int main(int argc, char* argv[]) {
                     h = (h ^ c) * 1099511628211ull;
                     c = ++t < le ? cls[(uint8_t)*t] : 0;
                 } while (c);
+                int64_t cur = -1;
                 for (uint32_t sl = (uint32_t)h & mask; slots[sl]; sl = (sl + 1) & mask) {
                     if ((uint32_t)(slots[sl] >> 32) != (uint32_t)(h >> 32)) continue;
                     uint32_t term = (uint32_t)slots[sl] - 1;
                     if (!same(b, t - b, terms[term])) continue;
                     vector<uint32_t>& v = s.post[term];
                     if (v.empty() || v.back() != id) v.push_back(id);
+                    cur = term;
                     break;
                 }
+                if (cur >= 0 && prev >= 0 && P) {
+                    uint64_t key = (uint64_t)prev << 32 | (uint64_t)cur;
+                    for (size_t x = (key * 0x9E3779B97F4A7C15ull) >> (64 - pbits); pkey[x]; x = (x + 1) & (pkey.size() - 1))
+                        if (pkey[x] == key + 1) {
+                            vector<uint32_t>& v = s.pp[pval[x]];
+                            if (v.empty() || v.back() != id) v.push_back(id);
+                            break;
+                        }
+                }
+                prev = cur;
             }
             p = le + 1;
         }
@@ -168,36 +203,58 @@ int main(int argc, char* argv[]) {
     const uint64_t M[6] = {0xAAAAAAAAAAAAAAAAull, 0xCCCCCCCCCCCCCCCCull, 0xF0F0F0F0F0F0F0F0ull,
                            0xFF00FF00FF00FF00ull, 0xFFFF0000FFFF0000ull, 0xFFFFFFFF00000000ull};
     vector<string> outs(queries.size());
-    parallel(n, [&](int i) {
+    atomic<size_t> next{0};
+    parallel(n, [&](int) {
         vector<uint64_t> acc(W), tmp(W);
         vector<pair<const char*, uint32_t>> toks;
         auto each = [&](uint32_t t, auto&& f) {
             for (const Slice& s : slices)
                 for (uint32_t d : s.post[t]) f(d);
         };
-        // Does doc d contain the terms ts as consecutive tokens?
+        auto eachPair = [&](uint32_t pi, auto&& f) {
+            for (const Slice& s : slices)
+                for (uint32_t d : s.pp[pi]) f(d);
+        };
+        // Does doc d contain the terms ts as consecutive tokens? One pass, no token vector.
         auto matches = [&](uint32_t d, const vector<uint32_t>& ts) {
             const char* t = base + off[d];
             const char* e = (const char*)memchr(t, '\n', fileEnd - t);
             if (!e) e = fileEnd;
-            toks.clear();
+            const string& f = terms[ts[0]];
+            const size_t fl = f.size(), m = ts.size();
+            const uint8_t f0 = (uint8_t)f[0];
             while (t < e) {
                 if (!cls[(uint8_t)*t]) { t++; continue; }
                 const char* b = t;
                 while (t < e && cls[(uint8_t)*t]) t++;
-                toks.push_back({b, (uint32_t)(t - b)});
-            }
-            for (size_t a = 0; a + ts.size() <= toks.size(); a++) {
-                size_t j = 0;
-                while (j < ts.size() && same(toks[a + j].first, toks[a + j].second, terms[ts[j]])) j++;
-                if (j == ts.size()) return true;
+                if ((size_t)(t - b) != fl || cls[(uint8_t)*b] != f0 || !same(b, fl, f)) continue;
+                const char* u = t;
+                size_t j = 1;
+                for (; j < m; j++) {
+                    while (u < e && !cls[(uint8_t)*u]) u++;
+                    if (u >= e) return false;  // too few tokens left for any later start too
+                    const char* b2 = u;
+                    while (u < e && cls[(uint8_t)*u]) u++;
+                    if (!same(b2, u - b2, terms[ts[j]])) break;
+                }
+                if (j == m) return true;
             }
             return false;
         };
 
-        for (size_t qi = i; qi < queries.size(); qi += n) {
+        for (size_t b0; (b0 = next.fetch_add(4)) < queries.size();)
+        for (size_t qi = b0, qe = min(b0 + 4, queries.size()); qi < qe; qi++) {
             const Query& q = queries[qi];
             fill(acc.begin(), acc.end(), 0);
+            if (q.phrase && q.terms.size() >= 2) {
+                // docs holding every adjacent pair; for two terms that is already the exact answer
+                eachPair(q.pairs[0], [&](uint32_t d) { acc[d >> 6] |= 1ull << (d & 63); });
+                for (size_t k = 1; k < q.pairs.size(); k++) {
+                    fill(tmp.begin(), tmp.end(), 0);
+                    eachPair(q.pairs[k], [&](uint32_t d) { tmp[d >> 6] |= 1ull << (d & 63); });
+                    for (size_t w = 0; w < W; w++) acc[w] &= tmp[w];
+                }
+            } else {
             each(q.terms[0], [&](uint32_t d) { acc[d >> 6] |= 1ull << (d & 63); });
             for (size_t k = 1; k < q.terms.size(); k++) {
                 char op = q.phrase || k - 1 >= q.ops.size() ? 'A' : q.ops[k - 1];
@@ -211,6 +268,7 @@ int main(int argc, char* argv[]) {
                     for (size_t w = 0; w < W; w++) acc[w] &= tmp[w];
                 }
             }
+            }
 
             // Count, sum of ids and the 10 smallest ids of the result.
             uint64_t cnt = 0, sum = 0;
@@ -218,7 +276,7 @@ int main(int argc, char* argv[]) {
             for (size_t w = 0; w < W; w++) {
                 uint64_t x = acc[w];
                 if (!x) continue;
-                if (q.phrase) {
+                if (q.phrase && q.terms.size() >= 3) {
                     for (; x; x &= x - 1) {
                         uint32_t d = 64 * w + countr_zero(x);
                         if (!matches(d, q.terms)) continue;
