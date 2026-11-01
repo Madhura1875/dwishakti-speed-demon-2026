@@ -109,6 +109,10 @@ struct Searcher {
     static void step(vector<Item>& h, Dist& dist, const Dist& other, const u32* head, const Arc* arcs, u64& mu) {
         Item it = h.front();
         pop_heap(h.begin(), h.end(), gt); h.pop_back();
+        if (!h.empty()) {                                  // warm the cache for the node we will settle next
+            u32 nx = h.front().v;
+            __builtin_prefetch(&arcs[head[nx]]);
+        }
         for (u32 i = head[it.v], e = head[it.v + 1]; i < e; ++i) {
             u64 nd = it.d + arcs[i].w; u32 v = arcs[i].to;
             if (nd < mu && nd < dist.get(v)) {
