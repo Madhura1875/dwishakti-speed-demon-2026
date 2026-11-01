@@ -1,20 +1,22 @@
 // Track D: shortest-path distances. The graph is streamed from the text file
 // into forward and reverse CSR arrays in two passes (count, then fill) without
-// ever holding the edge list; queries then run in parallel as bidirectional
-// Dijkstra on a radix heap.
+// ever holding the edge list; queries then run in parallel on every core as
+// bidirectional Dijkstra on a radix heap. Each query thread keeps its tentative
+// distances in a small hash table that only holds the nodes the query touched,
+// so adding threads costs little memory.
 //
 // Both passes parse a block of the file into a small edge array and then touch
 // the big arrays in batches: all cache lines of a batch are prefetched first,
 // so the random accesses overlap instead of waiting one by one behind the
 // locked increments.
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <sched.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -143,16 +145,56 @@ struct Heap {
 struct Searcher {
   const u32 *head[2];
   const Arc *arcs[2];
-  vector<array<u64, 2>> dd; // dd[v][0] forward, dd[v][1] backward distance: one
-                            // cache line serves both
-  vector<u32> touched[2];
+  // Tentative distances of the nodes this query has touched: d[0] forward from
+  // the source, d[1] backward from the target. key is node + 1, 0 means free.
+  struct Slot {
+    u64 d[2];
+    u32 key;
+  };
+  vector<Slot> tab = vector<Slot>(1 << 13);
+  vector<u32> used; // occupied slots, cleared after each query
   Heap heap[2];
-  Searcher(u32 n, const u32 *fh, const Arc *fa, const u32 *rh, const Arc *ra)
-      : head{fh, rh}, arcs{fa, ra}, dd(n, {INF, INF}) {}
+  Searcher(const u32 *fh, const Arc *fa, const u32 *rh, const Arc *ra)
+      : head{fh, rh}, arcs{fa, ra} {}
+
+  static u32 mix(u32 v) {
+    v *= 0x9E3779B1u;
+    return v ^ v >> 15;
+  }
+  void grow() {
+    vector<Slot> bigger(tab.size() * 2);
+    const u32 m = (u32)bigger.size() - 1;
+    for (u32 &i : used) {
+      u32 j = mix(tab[i].key - 1) & m;
+      while (bigger[j].key)
+        j = (j + 1) & m;
+      bigger[j] = tab[i];
+      i = j;
+    }
+    tab.swap(bigger);
+  }
+  // The slot of node v, created with both distances INF if it is new.
+  Slot &at(u32 v) {
+    for (;;) {
+      const u32 m = (u32)tab.size() - 1;
+      u32 i = mix(v) & m;
+      while (tab[i].key && tab[i].key != v + 1)
+        i = (i + 1) & m;
+      if (tab[i].key)
+        return tab[i];
+      if (used.size() * 2 >= tab.size()) {
+        grow();
+        continue;
+      }
+      tab[i] = Slot{{INF, INF}, v + 1};
+      used.push_back(i);
+      return tab[i];
+    }
+  }
 
   void clean(int s) {
     Heap &h = heap[s];
-    while (h.n && h.top().d > dd[h.top().v][s])
+    while (h.n && h.top().d > at(h.top().v).d[s])
       h.pop();
   }
   void step(int s, u64 &mu) {
@@ -161,18 +203,18 @@ struct Searcher {
     h.pop();
     const u32 lo = head[s][it.v], hi = head[s][it.v + 1];
     for (u32 i = lo; i < hi; ++i)
-      __builtin_prefetch(&dd[arcs[s][i].to]);
+      __builtin_prefetch(&tab[mix(arcs[s][i].to) & (tab.size() - 1)]);
     for (u32 i = lo; i < hi; ++i) {
       u64 nd = it.d + arcs[s][i].w;
+      if (nd >= mu)
+        continue;
       u32 v = arcs[s][i].to;
-      array<u64, 2> &x = dd[v];
-      if (nd < mu && nd < x[s]) {
-        if (x[s] == INF)
-          touched[s].push_back(v);
-        x[s] = nd;
+      Slot &x = at(v);
+      if (nd < x.d[s]) {
+        x.d[s] = nd;
         h.push({nd, v});
-        if (x[s ^ 1] != INF && nd + x[s ^ 1] < mu)
-          mu = nd + x[s ^ 1];
+        if (x.d[s ^ 1] != INF && nd + x.d[s ^ 1] < mu)
+          mu = nd + x.d[s ^ 1];
       }
     }
   }
@@ -180,11 +222,9 @@ struct Searcher {
     if (s == t)
       return 0;
     u64 mu = INF;
-    dd[s][0] = 0;
-    touched[0].push_back(s);
+    at(s).d[0] = 0;
     heap[0].push({0, s});
-    dd[t][1] = 0;
-    touched[1].push_back(t);
+    at(t).d[1] = 0;
     heap[1].push({0, t});
     for (;;) {
       clean(0);
@@ -193,12 +233,13 @@ struct Searcher {
         break;
       step(heap[0].n <= heap[1].n ? 0 : 1, mu);
     }
-    for (int d = 0; d < 2; ++d) {
-      for (u32 v : touched[d])
-        dd[v][d] = INF;
-      touched[d].clear();
-      heap[d].clear();
-    }
+    for (u32 i : used)
+      tab[i].key = 0;
+    used.clear();
+    if (tab.size() > (1 << 16)) // do not keep a huge table after a huge query
+      vector<Slot>(1 << 13).swap(tab);
+    heap[0].clear();
+    heap[1].clear();
     return mu;
   }
 };
@@ -220,7 +261,9 @@ int main(int argc, char **argv) {
   const char *gp = argc > 3 ? argv[1] : "/data/graph.txt";
   const char *qp = argc > 3 ? argv[2] : "/data/queries.txt";
   const char *op = argc > 3 ? argv[3] : "/out/distances.txt";
-  const int T = (int)min(8u, max(1u, thread::hardware_concurrency()));
+  cpu_set_t cs;
+  sched_getaffinity(0, sizeof cs, &cs);
+  const int T = clamp(CPU_COUNT(&cs), 1, 16);
 
   int fd = open(gp, O_RDONLY);
   if (fd < 0)
@@ -318,9 +361,9 @@ int main(int argc, char **argv) {
 
   vector<u64> ans(qs.size());
   atomic<size_t> nxt{0};
-  const int QT = (int)max<size_t>(1, min<size_t>(min(T, 4), qs.size()));
+  const int QT = (int)max<size_t>(1, min<size_t>(T, qs.size()));
   par(QT, [&](int) {
-    Searcher S(n, fh.data(), fa.get(), rh.data(), ra.get());
+    Searcher S(fh.data(), fa.get(), rh.data(), ra.get());
     for (size_t i; (i = nxt.fetch_add(1)) < qs.size();)
       ans[i] = S.run(qs[i].first, qs[i].second);
   });
