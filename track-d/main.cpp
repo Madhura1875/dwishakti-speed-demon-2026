@@ -8,6 +8,7 @@
 #include <string>
 #include <fcntl.h>
 #include <thread>
+#include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
@@ -45,7 +46,7 @@ template <class F> static void par(int T, F&& fn) {
 
 // Streams byte range [a,b) (whole lines) through 1 MB blocks, calls f(u,v,w) per edge.
 template <class F> static void stream_edges(int fd, off_t a, off_t b, F&& f) {
-    const size_t B = 1 << 20;
+    const size_t B = 1 << 18;
     vector<char> buf(B);
     size_t have = 0;
     off_t off = a;
@@ -138,7 +139,9 @@ int main(int argc, char** argv) {
     const char* gp = argc > 3 ? argv[1] : "/data/graph.txt";
     const char* qp = argc > 3 ? argv[2] : "/data/queries.txt";
     const char* op = argc > 3 ? argv[3] : "/out/distances.txt";
-    const int T = (int)min(8u, max(1u, thread::hardware_concurrency()));
+    cpu_set_t cs;
+    sched_getaffinity(0, sizeof cs, &cs);
+    const int T = clamp(CPU_COUNT(&cs), 1, 64);   // every core we are allowed to use
 
     int fd = open(gp, O_RDONLY);
     if (fd < 0) return 1;
@@ -201,7 +204,7 @@ int main(int argc, char** argv) {
 
     vector<u64> ans(qs.size());
     atomic<size_t> nxt{0};
-    const int QT = (int)max<size_t>(1, min<size_t>(min(T, 4), qs.size()));
+    const int QT = (int)max<size_t>(1, min<size_t>(T, qs.size()));
     par(QT, [&](int) {
         Searcher S(fh, fa, rh, ra);
         for (size_t i; (i = nxt.fetch_add(1)) < qs.size();) ans[i] = S.run(qs[i].first, qs[i].second);
