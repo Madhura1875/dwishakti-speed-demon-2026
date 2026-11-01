@@ -65,43 +65,68 @@ template <class F> static void stream_edges(int fd, off_t a, off_t b, F&& f) {
     }
 }
 
+// Distances found so far in one search direction: an open-addressing table that
+// only grows with the vertices actually reached, not with n.
+struct Dist {
+    vector<u32> key = vector<u32>(1024, ~0u);
+    vector<u64> val = vector<u64>(1024);
+    size_t used = 0;
+    size_t slot(u32 v) const {
+        size_t m = key.size() - 1, i = (v * 2654435761u >> 7) & m;
+        while (key[i] != ~0u && key[i] != v) i = (i + 1) & m;
+        return i;
+    }
+    u64 get(u32 v) const { size_t i = slot(v); return key[i] == v ? val[i] : INF; }
+    void set(u32 v, u64 d) {
+        size_t i = slot(v);
+        if (key[i] != v) {
+            if (++used * 2 > key.size()) {
+                vector<u32> k(key.size() * 2, ~0u);
+                vector<u64> x(k.size());
+                k.swap(key); x.swap(val);
+                for (size_t j = 0; j < k.size(); ++j) if (k[j] != ~0u) { size_t t = slot(k[j]); key[t] = k[j]; val[t] = x[j]; }
+                i = slot(v);
+            }
+            key[i] = v;
+        }
+        val[i] = d;
+    }
+    void clear() { fill(key.begin(), key.end(), ~0u); used = 0; }
+};
+
 struct Searcher {
     const u32 *fh, *rh; const Arc *fa, *ra;
-    vector<u64> df, db; vector<u32> tf, tb; vector<Item> hf, hb;
-    Searcher(u32 n, const u32* a, const Arc* b, const u32* c, const Arc* d)
-        : fh(a), rh(c), fa(b), ra(d), df(n, INF), db(n, INF) {}
+    Dist df, db; vector<Item> hf, hb;
+    Searcher(const u32* a, const Arc* b, const u32* c, const Arc* d) : fh(a), rh(c), fa(b), ra(d) {}
 
-    static void clean(vector<Item>& h, const vector<u64>& dist) {
-        while (!h.empty() && h.front().d > dist[h.front().v]) { pop_heap(h.begin(), h.end(), gt); h.pop_back(); }
+    static void clean(vector<Item>& h, const Dist& dist) {
+        while (!h.empty() && h.front().d > dist.get(h.front().v)) { pop_heap(h.begin(), h.end(), gt); h.pop_back(); }
     }
-    static void step(vector<Item>& h, vector<u64>& dist, vector<u32>& tch, const vector<u64>& other,
-                     const u32* head, const Arc* arcs, u64& mu) {
+    static void step(vector<Item>& h, Dist& dist, const Dist& other, const u32* head, const Arc* arcs, u64& mu) {
         Item it = h.front();
         pop_heap(h.begin(), h.end(), gt); h.pop_back();
         for (u32 i = head[it.v], e = head[it.v + 1]; i < e; ++i) {
             u64 nd = it.d + arcs[i].w; u32 v = arcs[i].to;
-            if (nd < mu && nd < dist[v]) {
-                if (dist[v] == INF) tch.push_back(v);
-                dist[v] = nd;
+            if (nd < mu && nd < dist.get(v)) {
+                dist.set(v, nd);
                 h.push_back({nd, v}); push_heap(h.begin(), h.end(), gt);
-                if (other[v] != INF && nd + other[v] < mu) mu = nd + other[v];
+                u64 o = other.get(v);
+                if (o != INF && nd + o < mu) mu = nd + o;
             }
         }
     }
     u64 run(u32 s, u32 t) {
         if (s == t) return 0;
         u64 mu = INF;
-        df[s] = 0; tf.push_back(s); hf.push_back({0, s});
-        db[t] = 0; tb.push_back(t); hb.push_back({0, t});
+        df.set(s, 0); hf.push_back({0, s});
+        db.set(t, 0); hb.push_back({0, t});
         for (;;) {
             clean(hf, df); clean(hb, db);
             if (hf.empty() || hb.empty() || hf.front().d + hb.front().d >= mu) break;
-            if (hf.size() <= hb.size()) step(hf, df, tf, db, fh, fa, mu);
-            else step(hb, db, tb, df, rh, ra, mu);
+            if (hf.size() <= hb.size()) step(hf, df, db, fh, fa, mu);
+            else step(hb, db, df, rh, ra, mu);
         }
-        for (u32 v : tf) df[v] = INF;
-        for (u32 v : tb) db[v] = INF;
-        tf.clear(); tb.clear(); hf.clear(); hb.clear();
+        df.clear(); db.clear(); hf.clear(); hb.clear();
         return mu;
     }
 };
@@ -166,7 +191,7 @@ int main(int argc, char** argv) {
     atomic<size_t> nxt{0};
     const int QT = (int)max<size_t>(1, min<size_t>(min(T, 4), qs.size()));
     par(QT, [&](int) {
-        Searcher S(n, fh.data(), fa, rh.data(), ra);
+        Searcher S(fh.data(), fa, rh.data(), ra);
         for (size_t i; (i = nxt.fetch_add(1)) < qs.size();) ans[i] = S.run(qs[i].first, qs[i].second);
     });
 
