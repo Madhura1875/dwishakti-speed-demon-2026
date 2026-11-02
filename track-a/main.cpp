@@ -172,16 +172,9 @@ static inline void pick(u32 *b, u64 c, u64 r50, u64 r95, u64 r99, u32 *q) {
       b[j] = v;
     }
   } else {
-    // Median first: each later pass only looks at what is not below the
-    // previous rank (about 1.55 c elements in total instead of 2.9 c). A rank
-    // is read as soon as it is placed, because the next pass may move it.
-    nth_element(b, b + r50, b + c);
-    q[0] = b[r50];
-    nth_element(b + r50, b + r95, b + c);
-    q[1] = b[r95];
-    nth_element(b + r95, b + r99, b + c);
-    q[2] = b[r99];
-    return;
+    nth_element(b, b + r99, b + c);
+    nth_element(b, b + r95, b + r99);
+    nth_element(b, b + r50, b + r95);
   }
   q[0] = b[r50];
   q[1] = b[r95];
