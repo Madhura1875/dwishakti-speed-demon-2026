@@ -8,6 +8,8 @@
 #include <string>
 #include <fcntl.h>
 #include <thread>
+#include <sched.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 using namespace std;
@@ -27,6 +29,14 @@ static inline bool next_num(const char*& p, const char* e, u32& x) {
     return true;
 }
 
+// Large random-access arrays: ask for 2 MB pages to cut TLB misses (harmless if the kernel declines).
+template <class T> static T* huge(size_t n) {
+    size_t bytes = (n * sizeof(T) + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+    void* p = aligned_alloc(2u << 20, bytes ? bytes : 2u << 20);
+    madvise(p, bytes, MADV_HUGEPAGE);
+    return (T*)p;
+}
+
 template <class F> static void par(int T, F&& fn) {
     vector<thread> th;
     for (int t = 1; t < T; ++t) th.emplace_back([&fn, t] { fn(t); });
@@ -36,7 +46,7 @@ template <class F> static void par(int T, F&& fn) {
 
 // Streams byte range [a,b) (whole lines) through 1 MB blocks, calls f(u,v,w) per edge.
 template <class F> static void stream_edges(int fd, off_t a, off_t b, F&& f) {
-    const size_t B = 1 << 20;
+    const size_t B = 1 << 18;
     vector<char> buf(B);
     size_t have = 0;
     off_t off = a;
@@ -55,43 +65,76 @@ template <class F> static void stream_edges(int fd, off_t a, off_t b, F&& f) {
     }
 }
 
+// Small open-addressing map node -> tentative distance. A query touches only a few thousand nodes, so this
+// stays in cache, unlike a full n-sized array per thread (also cuts ~28 MB of memory per thread).
+struct Dist {
+    static constexpr u32 EMPTY = UINT32_MAX;
+    vector<u32> key; vector<u64> val; vector<u32> used; int shift = 0;
+    Dist() { init(14); }
+    void init(int bits) { key.assign(1u << bits, EMPTY); val.resize(1u << bits); used.clear(); shift = 32 - bits; }
+    u32 slot(u32 k) const {
+        u32 mask = key.size() - 1, s = (k * 0x9E3779B1u) >> shift;
+        while (key[s] != EMPTY && key[s] != k) s = (s + 1) & mask;
+        return s;
+    }
+    u64 get(u32 k) const { u32 s = slot(k); return key[s] == k ? val[s] : INF; }
+    void set(u32 k, u64 v) {
+        u32 s = slot(k);
+        if (key[s] == EMPTY) {
+            key[s] = k; used.push_back(s);
+            if (used.size() * 2 > key.size()) {            // grow
+                vector<u32> ok = key; vector<u64> ov = val; vector<u32> ou = used;
+                init(33 - shift);
+                for (u32 u : ou) { u32 t = slot(ok[u]); key[t] = ok[u]; val[t] = ov[u]; used.push_back(t); }
+                s = slot(k);
+            }
+        }
+        val[s] = v;
+    }
+    void clear() {
+        if (key.size() > (1u << 16)) { init(14); return; }
+        for (u32 s : used) key[s] = EMPTY;
+        used.clear();
+    }
+};
+
 struct Searcher {
     const u32 *fh, *rh; const Arc *fa, *ra;
-    vector<u64> df, db; vector<u32> tf, tb; vector<Item> hf, hb;
-    Searcher(u32 n, const u32* a, const Arc* b, const u32* c, const Arc* d)
-        : fh(a), rh(c), fa(b), ra(d), df(n, INF), db(n, INF) {}
+    Dist df, db; vector<Item> hf, hb;
+    Searcher(const u32* a, const Arc* b, const u32* c, const Arc* d) : fh(a), rh(c), fa(b), ra(d) {}
 
-    static void clean(vector<Item>& h, const vector<u64>& dist) {
-        while (!h.empty() && h.front().d > dist[h.front().v]) { pop_heap(h.begin(), h.end(), gt); h.pop_back(); }
+    static void clean(vector<Item>& h, const Dist& dist) {
+        while (!h.empty() && h.front().d > dist.get(h.front().v)) { pop_heap(h.begin(), h.end(), gt); h.pop_back(); }
     }
-    static void step(vector<Item>& h, vector<u64>& dist, vector<u32>& tch, const vector<u64>& other,
-                     const u32* head, const Arc* arcs, u64& mu) {
+    static void step(vector<Item>& h, Dist& dist, const Dist& other, const u32* head, const Arc* arcs, u64& mu) {
         Item it = h.front();
         pop_heap(h.begin(), h.end(), gt); h.pop_back();
+        if (!h.empty()) {                                  // warm the cache for the node we will settle next
+            u32 nx = h.front().v;
+            __builtin_prefetch(&arcs[head[nx]]);
+        }
         for (u32 i = head[it.v], e = head[it.v + 1]; i < e; ++i) {
             u64 nd = it.d + arcs[i].w; u32 v = arcs[i].to;
-            if (nd < mu && nd < dist[v]) {
-                if (dist[v] == INF) tch.push_back(v);
-                dist[v] = nd;
+            if (nd < mu && nd < dist.get(v)) {
+                dist.set(v, nd);
                 h.push_back({nd, v}); push_heap(h.begin(), h.end(), gt);
-                if (other[v] != INF && nd + other[v] < mu) mu = nd + other[v];
+                u64 o = other.get(v);
+                if (o != INF && nd + o < mu) mu = nd + o;
             }
         }
     }
     u64 run(u32 s, u32 t) {
         if (s == t) return 0;
         u64 mu = INF;
-        df[s] = 0; tf.push_back(s); hf.push_back({0, s});
-        db[t] = 0; tb.push_back(t); hb.push_back({0, t});
+        df.set(s, 0); hf.push_back({0, s});
+        db.set(t, 0); hb.push_back({0, t});
         for (;;) {
             clean(hf, df); clean(hb, db);
             if (hf.empty() || hb.empty() || hf.front().d + hb.front().d >= mu) break;
-            if (hf.size() <= hb.size()) step(hf, df, tf, db, fh, fa, mu);
-            else step(hb, db, tb, df, rh, ra, mu);
+            if (hf.size() <= hb.size()) step(hf, df, db, fh, fa, mu);
+            else step(hb, db, df, rh, ra, mu);
         }
-        for (u32 v : tf) df[v] = INF;
-        for (u32 v : tb) db[v] = INF;
-        tf.clear(); tb.clear(); hf.clear(); hb.clear();
+        df.clear(); db.clear(); hf.clear(); hb.clear();
         return mu;
     }
 };
@@ -100,7 +143,9 @@ int main(int argc, char** argv) {
     const char* gp = argc > 3 ? argv[1] : "/data/graph.txt";
     const char* qp = argc > 3 ? argv[2] : "/data/queries.txt";
     const char* op = argc > 3 ? argv[3] : "/out/distances.txt";
-    const int T = (int)min(8u, max(1u, thread::hardware_concurrency()));
+    cpu_set_t cs;
+    sched_getaffinity(0, sizeof cs, &cs);
+    const int T = clamp(CPU_COUNT(&cs), 1, 64);   // every core we are allowed to use
 
     int fd = open(gp, O_RDONLY);
     if (fd < 0) return 1;
@@ -126,7 +171,8 @@ int main(int argc, char** argv) {
         cb[t] = bnd;
     }
 
-    vector<u32> fh(n + 1, 0), rh(n + 1, 0);
+    u32 *fh = huge<u32>(n + 1), *rh = huge<u32>(n + 1);
+    memset(fh, 0, (n + 1) * 4); memset(rh, 0, (n + 1) * 4);
     auto cnt = [&](int t) {
         stream_edges(fd, cb[t], cb[t + 1], [&](u32 u, u32 v, u32) {
             atomic_ref<u32>(fh[u]).fetch_add(1, memory_order_relaxed);
@@ -139,7 +185,7 @@ int main(int argc, char** argv) {
         u32 a = fh[u]; fh[u] = fs; fs += a;
         u32 b = rh[u]; rh[u] = rs; rs += b;
     }
-    vector<Arc> fa(fs), ra(rs);
+    Arc *fa = huge<Arc>(fs), *ra = huge<Arc>(rs);
     par(T, [&](int t) {
         stream_edges(fd, cb[t], cb[t + 1], [&](u32 u, u32 v, u32 w) {
             fa[atomic_ref<u32>(fh[u]).fetch_add(1, memory_order_relaxed)] = {v, w};
@@ -162,9 +208,9 @@ int main(int argc, char** argv) {
 
     vector<u64> ans(qs.size());
     atomic<size_t> nxt{0};
-    const int QT = (int)max<size_t>(1, min<size_t>(min(T, 4), qs.size()));
+    const int QT = (int)max<size_t>(1, min<size_t>(T, qs.size()));
     par(QT, [&](int) {
-        Searcher S(n, fh.data(), fa.data(), rh.data(), ra.data());
+        Searcher S(fh, fa, rh, ra);
         for (size_t i; (i = nxt.fetch_add(1)) < qs.size();) ans[i] = S.run(qs[i].first, qs[i].second);
     });
 
